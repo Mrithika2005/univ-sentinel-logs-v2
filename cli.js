@@ -1,19 +1,18 @@
 #!/usr/bin/env node
 
-// univ-sentinel CLI  v2.1
+// univ-sentinel CLI  v2.2
 // Usage: npx --yes github:Mrithika2005/univ-sentinel-logs-v2
 // Run inside your project root
 
-import fs   from 'fs';
-import path from 'path';
-import { fileURLToPath } from 'url';
+import fs        from 'fs';
+import path      from 'path';
+import { execSync, spawn } from 'child_process';
+import { fileURLToPath }   from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 /* ─────────────────────────────────────────────────────────────
    CONFIG — reads SENTINEL_HOST from env, defaults to LAN IP
-   On your PC run:    npx tsx server.ts
-   On client PCs run: SENTINEL_HOST=192.168.1.153 npx --yes github:Mrithika2005/univ-sentinel-logs-v2
 ───────────────────────────────────────────────────────────── */
 
 const SENTINEL_HOST = process.env.SENTINEL_HOST || '192.168.1.153';
@@ -37,7 +36,6 @@ const log = {
 
 /* ─────────────────────────────────────────────────────────────
    PYTHON PATCH
-   Injects full init_sentinel() wired to your LAN IP
 ───────────────────────────────────────────────────────────── */
 
 const PYTHON_MARKER = '# ── sentinel-sdk ──';
@@ -66,10 +64,7 @@ except Exception as _e:
 
 function patchPython(filePath) {
   let src = fs.readFileSync(filePath, 'utf-8');
-  if (src.includes(PYTHON_MARKER)) {
-    log.warn(`${filePath} already patched — skipping`);
-    return;
-  }
+  if (src.includes(PYTHON_MARKER)) { log.warn(`${filePath} already patched — skipping`); return; }
   const lines = src.split('\n');
   let lastImport = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -82,9 +77,6 @@ function patchPython(filePath) {
 
 /* ─────────────────────────────────────────────────────────────
    NODE.JS PATCH
-   Injects initSentinel() at top of server entry files
-   Wired to LAN IP — so Node backend on client PCs sends
-   logs to your ClickHouse at 192.168.1.153
 ───────────────────────────────────────────────────────────── */
 
 const NODE_MARKER = '// ── sentinel-sdk-node ──';
@@ -113,19 +105,14 @@ const BROWSER_SIGS  = ['React', 'ReactDOM', 'createRoot', 'angular', 'NgModule',
 
 function isNodeEntryFile(filePath, src) {
   if (!NODE_ENTRY_RE.test(path.basename(filePath))) return false;
-  for (const sig of BROWSER_SIGS) {
-    if (src.includes(sig)) return false;
-  }
+  for (const sig of BROWSER_SIGS) { if (src.includes(sig)) return false; }
   return true;
 }
 
 function patchNode(filePath) {
   let src = fs.readFileSync(filePath, 'utf-8');
   if (!isNodeEntryFile(filePath, src)) return false;
-  if (src.includes(NODE_MARKER)) {
-    log.warn(`${filePath} already patched — skipping`);
-    return true;
-  }
+  if (src.includes(NODE_MARKER)) { log.warn(`${filePath} already patched — skipping`); return true; }
   const lines = src.split('\n');
   let lastImport = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -139,13 +126,10 @@ function patchNode(filePath) {
 
 /* ─────────────────────────────────────────────────────────────
    BROWSER PATCH — React + Angular
-   Points relayUrl to 192.168.1.153 so browsers on other PCs
-   POST logs to your relay server over LAN
 ───────────────────────────────────────────────────────────── */
 
 const BROWSER_MARKER = '// ── sentinel-sdk-browser ──';
 
-// React: App.tsx / App.jsx
 const REACT_SNIPPET = `
 ${BROWSER_MARKER}
 import { initBrowserSentinel as __initBrowserSentinel } from './sentinel-sdk/browser/agent.ts';
@@ -158,7 +142,6 @@ __initBrowserSentinel({
 // ── /sentinel-sdk-browser ──
 `;
 
-// Angular: app.component.ts / app.module.ts
 const ANGULAR_SNIPPET = `
 ${BROWSER_MARKER}
 // @ts-ignore
@@ -179,23 +162,75 @@ const ANGULAR_FILE_RE = /^app\.(component|module)\.[jt]s$/;
 
 function patchBrowser(filePath) {
   let src = fs.readFileSync(filePath, 'utf-8');
-  if (src.includes(BROWSER_MARKER)) {
-    log.warn(`${filePath} already patched — skipping`);
-    return;
-  }
+  if (src.includes(BROWSER_MARKER)) { log.warn(`${filePath} already patched — skipping`); return; }
   const name      = path.basename(filePath);
   const isAngular = ANGULAR_FILE_RE.test(name);
   const snippet   = isAngular ? ANGULAR_SNIPPET : REACT_SNIPPET;
   const label     = isAngular ? 'Angular' : 'React';
-
-  const lines = src.split('\n');
-  let lastImport = 0;
+  const lines     = src.split('\n');
+  let lastImport  = 0;
   for (let i = 0; i < lines.length; i++) {
     if (/^import /.test(lines[i])) lastImport = i;
   }
   lines.splice(lastImport + 1, 0, snippet);
   fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
   log.ok(`Patched ${label}: ${filePath}`);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   AUTO COPY sentinel-sdk into the right place
+───────────────────────────────────────────────────────────── */
+
+function copySentinelSdk(cwd, hasSrc) {
+  const sdkSrc  = path.join(__dirname, 'sentinel-sdk');
+  const sdkDest = hasSrc ? path.join(cwd, 'src', 'sentinel-sdk') : path.join(cwd, 'sentinel-sdk');
+
+  if (!fs.existsSync(sdkSrc)) {
+    log.warn('sentinel-sdk folder not found in package — skipping copy');
+    return;
+  }
+
+  if (fs.existsSync(sdkDest)) {
+    log.warn(`sentinel-sdk already exists at ${sdkDest} — skipping copy`);
+    return;
+  }
+
+  fs.cpSync(sdkSrc, sdkDest, { recursive: true });
+  log.ok(`Copied sentinel-sdk → ${sdkDest}`);
+}
+
+/* ─────────────────────────────────────────────────────────────
+   AUTO START relay server in background
+───────────────────────────────────────────────────────────── */
+
+function startRelayServer() {
+  const serverPath = path.join(__dirname, 'server.ts');
+  if (!fs.existsSync(serverPath)) {
+    log.warn('server.ts not found — skipping relay server start');
+    return;
+  }
+
+  const CH_HOST = process.env.CLICKHOUSE_HOST     || `http://${SENTINEL_HOST}:8123`;
+  const CH_USER = process.env.CLICKHOUSE_USER     || '';
+  const CH_PASS = process.env.CLICKHOUSE_PASSWORD || '';
+
+  log.info('Starting relay server in background...');
+
+  const child = spawn('npx', ['tsx', serverPath], {
+    detached: true,
+    stdio:    'ignore',
+    env: {
+      ...process.env,
+      CLICKHOUSE_HOST:     CH_HOST,
+      CLICKHOUSE_USER:     CH_USER,
+      CLICKHOUSE_PASSWORD: CH_PASS,
+      SENTINEL_PORT:       SENTINEL_PORT,
+    },
+  });
+
+  child.unref();
+  log.ok(`Relay server started in background on port ${SENTINEL_PORT}`);
+  log.info(`Health check: http://${SENTINEL_HOST}:${SENTINEL_PORT}/sentinel/health`);
 }
 
 /* ─────────────────────────────────────────────────────────────
@@ -219,9 +254,11 @@ function findFiles(dir, matcher, results = []) {
    MAIN
 ───────────────────────────────────────────────────────────── */
 
-console.log(C.bold('\n  univ-sentinel v2.1 — LAN-aware auto-patch\n'));
+console.log(C.bold('\n  univ-sentinel v2.2 — LAN-aware auto-patch\n'));
 
-const cwd = process.cwd();
+const cwd    = process.cwd();
+const hasSrc = fs.existsSync(path.join(cwd, 'src'));
+
 log.info(`Scanning:      ${cwd}`);
 log.info(`Relay target:  ${SENTINEL_URL}\n`);
 
@@ -252,16 +289,22 @@ if (patched === 0) {
   process.exit(1);
 }
 
+// 5. Auto-copy sentinel-sdk into the right place
+console.log('');
+copySentinelSdk(cwd, hasSrc);
+
+// 6. Auto-start relay server in background
+startRelayServer();
+
 console.log('');
 log.ok(`Done! ${patched} file(s) patched.`);
 console.log(C.cyan(`
-  ┌─────────────────────────────────────────────────┐
-  │  YOUR PC (192.168.1.153)                        │
-  │  Run:  npx tsx server.ts                        │
-  │  Check: http://192.168.1.153:4318/sentinel/health│
-  │                                                 │
-  │  CLIENT PCs — run the patch command like this:  │
-  │  SENTINEL_HOST=192.168.1.153 npx --yes          │
-  │    github:Mrithika2005/univ-sentinel-logs-v2    │
-  └─────────────────────────────────────────────────┘
+  ┌─────────────────────────────────────────────────────┐
+  │  univ-sentinel v2.2 — all done!                     │
+  │                                                     │
+  │  Relay:  http://${SENTINEL_HOST}:${SENTINEL_PORT}/sentinel/health  │
+  │  Logs:   http://${SENTINEL_HOST}:8123/play           │
+  │                                                     │
+  │  Just run your app — logs flow automatically!       │
+  └─────────────────────────────────────────────────────┘
 `));
