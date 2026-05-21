@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 
-// univ-sentinel CLI  v2.0
+// univ-sentinel CLI  v2.1
 // Usage: npx --yes github:Mrithika2005/univ-sentinel-logs-v2
+// Run inside your project root
 
 import fs   from 'fs';
 import path from 'path';
@@ -9,8 +10,15 @@ import { fileURLToPath } from 'url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/* ─────────────────────────────────────────────────────────────
+   CONFIG — reads SENTINEL_HOST from env, defaults to LAN IP
+   On your PC run:    npx tsx server.ts
+   On client PCs run: SENTINEL_HOST=192.168.1.153 npx --yes github:Mrithika2005/univ-sentinel-logs-v2
+───────────────────────────────────────────────────────────── */
+
+const SENTINEL_HOST = process.env.SENTINEL_HOST || '192.168.1.153';
 const SENTINEL_PORT = process.env.SENTINEL_PORT || '4318';
-const SENTINEL_URL  = `http://localhost:${SENTINEL_PORT}/sentinel/ingest`;
+const SENTINEL_URL  = `http://${SENTINEL_HOST}:${SENTINEL_PORT}/sentinel/ingest`;
 
 const C = {
   green:  (s) => `\x1b[32m${s}\x1b[0m`,
@@ -29,10 +37,10 @@ const log = {
 
 /* ─────────────────────────────────────────────────────────────
    PYTHON PATCH
-   Injects full init_sentinel() call into main.py
+   Injects full init_sentinel() wired to your LAN IP
 ───────────────────────────────────────────────────────────── */
 
-const PYTHON_MARKER  = '# ── sentinel-sdk ──';
+const PYTHON_MARKER = '# ── sentinel-sdk ──';
 
 const PYTHON_SNIPPET = `
 ${PYTHON_MARKER}
@@ -42,7 +50,7 @@ try:
     from agent import init_sentinel as _init_sentinel
     _sentinel = _init_sentinel(
         service_name=_os.getenv('SENTINEL_SERVICE', 'python-service'),
-        clickhouse_host=_os.getenv('CLICKHOUSE_HOST', 'http://localhost:8123'),
+        clickhouse_host=_os.getenv('CLICKHOUSE_HOST', 'http://${SENTINEL_HOST}:8123'),
         clickhouse_database=_os.getenv('CLICKHOUSE_DATABASE', 'sentinel'),
         clickhouse_table=_os.getenv('CLICKHOUSE_TABLE', 'logs'),
         clickhouse_user=_os.getenv('CLICKHOUSE_USER', ''),
@@ -73,18 +81,20 @@ function patchPython(filePath) {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   NODE.JS PATCH  (index.ts / server.ts / app.ts / main.ts)
-   Injects initSentinel() at the very top — before anything else
+   NODE.JS PATCH
+   Injects initSentinel() at top of server entry files
+   Wired to LAN IP — so Node backend on client PCs sends
+   logs to your ClickHouse at 192.168.1.153
 ───────────────────────────────────────────────────────────── */
 
-const NODE_MARKER  = '// ── sentinel-sdk-node ──';
+const NODE_MARKER = '// ── sentinel-sdk-node ──';
 
 const NODE_SNIPPET = `
 ${NODE_MARKER}
 import { initSentinel as __initSentinel } from './sentinel-sdk/node/agent.ts';
 await __initSentinel({
   serviceName:        process.env.SENTINEL_SERVICE        || 'node-service',
-  clickhouseHost:     process.env.CLICKHOUSE_HOST         || 'http://localhost:8123',
+  clickhouseHost:     process.env.CLICKHOUSE_HOST         || 'http://${SENTINEL_HOST}:8123',
   clickhouseDatabase: process.env.CLICKHOUSE_DATABASE     || 'sentinel',
   clickhouseTable:    process.env.CLICKHOUSE_TABLE        || 'logs',
   clickhouseUser:     process.env.CLICKHOUSE_USER         || '',
@@ -98,16 +108,12 @@ await __initSentinel({
 // ── /sentinel-sdk-node ──
 `;
 
-// Files that are Node.js entry points (not frontend)
-const NODE_ENTRY_NAMES = /^(index|server|app|main)\.[jt]s$/;
-// Files we should NOT patch (they are frontend/browser files)
-const SKIP_IF_CONTAINS  = ['React', 'ReactDOM', 'createRoot', 'angular', 'NgModule', 'bootstrapModule'];
+const NODE_ENTRY_RE = /^(index|server|app|main)\.[jt]s$/;
+const BROWSER_SIGS  = ['React', 'ReactDOM', 'createRoot', 'angular', 'NgModule', 'bootstrapModule'];
 
-function isNodeFile(filePath, src) {
-  const name = path.basename(filePath);
-  if (!NODE_ENTRY_NAMES.test(name)) return false;
-  // Skip if it looks like a browser/frontend file
-  for (const sig of SKIP_IF_CONTAINS) {
+function isNodeEntryFile(filePath, src) {
+  if (!NODE_ENTRY_RE.test(path.basename(filePath))) return false;
+  for (const sig of BROWSER_SIGS) {
     if (src.includes(sig)) return false;
   }
   return true;
@@ -115,12 +121,11 @@ function isNodeFile(filePath, src) {
 
 function patchNode(filePath) {
   let src = fs.readFileSync(filePath, 'utf-8');
-  if (!isNodeFile(filePath, src)) return false;
+  if (!isNodeEntryFile(filePath, src)) return false;
   if (src.includes(NODE_MARKER)) {
     log.warn(`${filePath} already patched — skipping`);
     return true;
   }
-  // Insert after last import line
   const lines = src.split('\n');
   let lastImport = 0;
   for (let i = 0; i < lines.length; i++) {
@@ -133,26 +138,27 @@ function patchNode(filePath) {
 }
 
 /* ─────────────────────────────────────────────────────────────
-   BROWSER PATCH  (React App.tsx / App.jsx / Angular app.component.ts)
-   Injects initBrowserSentinel() — full browser agent with
-   fetch/XHR hooks, web vitals, error tracking, etc.
+   BROWSER PATCH — React + Angular
+   Points relayUrl to 192.168.1.153 so browsers on other PCs
+   POST logs to your relay server over LAN
 ───────────────────────────────────────────────────────────── */
 
-const BROWSER_MARKER  = '// ── sentinel-sdk-browser ──';
+const BROWSER_MARKER = '// ── sentinel-sdk-browser ──';
 
-const BROWSER_SNIPPET = `
+// React: App.tsx / App.jsx
+const REACT_SNIPPET = `
 ${BROWSER_MARKER}
 import { initBrowserSentinel as __initBrowserSentinel } from './sentinel-sdk/browser/agent.ts';
 __initBrowserSentinel({
-  serviceName:   (window.__SENTINEL_SERVICE__  || 'browser-app'),
-  relayUrl:      (window.__SENTINEL_RELAY__    || '${SENTINEL_URL}'),
-  debug:         (window.__SENTINEL_DEBUG__    || false),
-  samplingRate:  (window.__SENTINEL_SAMPLING__ || 1.0),
+  serviceName:  (window.__SENTINEL_SERVICE__  || 'browser-app'),
+  relayUrl:     (window.__SENTINEL_RELAY__    || '${SENTINEL_URL}'),
+  debug:        (window.__SENTINEL_DEBUG__    || false),
+  samplingRate: (window.__SENTINEL_SAMPLING__ || 1.0),
 });
 // ── /sentinel-sdk-browser ──
 `;
 
-// Angular-specific — wraps in a try/catch since it's module-scoped
+// Angular: app.component.ts / app.module.ts
 const ANGULAR_SNIPPET = `
 ${BROWSER_MARKER}
 // @ts-ignore
@@ -168,9 +174,7 @@ try {
 // ── /sentinel-sdk-browser ──
 `;
 
-// React: App.jsx / App.tsx
 const REACT_FILE_RE   = /^[Aa]pp\.[jt]sx?$/;
-// Angular: app.component.ts / app.module.ts
 const ANGULAR_FILE_RE = /^app\.(component|module)\.[jt]s$/;
 
 function patchBrowser(filePath) {
@@ -179,11 +183,10 @@ function patchBrowser(filePath) {
     log.warn(`${filePath} already patched — skipping`);
     return;
   }
-
-  const name     = path.basename(filePath);
+  const name      = path.basename(filePath);
   const isAngular = ANGULAR_FILE_RE.test(name);
-  const snippet  = isAngular ? ANGULAR_SNIPPET : BROWSER_SNIPPET;
-  const label    = isAngular ? 'Angular' : 'React/Browser';
+  const snippet   = isAngular ? ANGULAR_SNIPPET : REACT_SNIPPET;
+  const label     = isAngular ? 'Angular' : 'React';
 
   const lines = src.split('\n');
   let lastImport = 0;
@@ -207,7 +210,7 @@ function findFiles(dir, matcher, results = []) {
     if (SKIP_DIRS.has(entry.name)) continue;
     const full = path.join(dir, entry.name);
     if (entry.isDirectory()) findFiles(full, matcher, results);
-    else if (matcher(entry.name, full)) results.push(full);
+    else if (matcher(entry.name)) results.push(full);
   }
   return results;
 }
@@ -216,45 +219,33 @@ function findFiles(dir, matcher, results = []) {
    MAIN
 ───────────────────────────────────────────────────────────── */
 
-console.log(C.bold('\n  univ-sentinel v2.0 — auto-patch\n'));
+console.log(C.bold('\n  univ-sentinel v2.1 — LAN-aware auto-patch\n'));
 
 const cwd = process.cwd();
-log.info(`Scanning: ${cwd}\n`);
+log.info(`Scanning:      ${cwd}`);
+log.info(`Relay target:  ${SENTINEL_URL}\n`);
 
 let patched = 0;
 
-// 1. Python — main.py anywhere in tree
+// 1. Python
 const pyFiles = findFiles(cwd, (n) => n === 'main.py');
-if (pyFiles.length === 0) {
-  log.warn('No main.py found — skipping Python patch');
-} else {
-  pyFiles.forEach(f => { patchPython(f); patched++; });
-}
+if (pyFiles.length === 0) log.warn('No main.py found — skipping Python patch');
+else pyFiles.forEach(f => { patchPython(f); patched++; });
 
-// 2. Node.js backend entry points
-const nodeFiles = findFiles(cwd, (n) => NODE_ENTRY_NAMES.test(n));
-nodeFiles.forEach(f => {
-  if (patchNode(f)) patched++;
-});
-if (patched === 0 && nodeFiles.length === 0) {
-  log.warn('No Node.js entry file found (index.ts/server.ts/app.ts/main.ts) — skipping Node patch');
-}
+// 2. Node backend
+const nodeFiles = findFiles(cwd, (n) => NODE_ENTRY_RE.test(n));
+nodeFiles.forEach(f => { if (patchNode(f)) patched++; });
+if (nodeFiles.length === 0) log.warn('No Node entry file (index/server/app/main .ts/.js) — skipping Node patch');
 
-// 3. React — App.jsx / App.tsx
+// 3. React
 const reactFiles = findFiles(cwd, (n) => REACT_FILE_RE.test(n));
-if (reactFiles.length === 0) {
-  log.warn('No App.jsx/App.tsx found — skipping React patch');
-} else {
-  reactFiles.forEach(f => { patchBrowser(f); patched++; });
-}
+if (reactFiles.length === 0) log.warn('No App.jsx/App.tsx found — skipping React patch');
+else reactFiles.forEach(f => { patchBrowser(f); patched++; });
 
-// 4. Angular — app.component.ts / app.module.ts
+// 4. Angular
 const angularFiles = findFiles(cwd, (n) => ANGULAR_FILE_RE.test(n));
-if (angularFiles.length === 0) {
-  log.warn('No app.component.ts/app.module.ts found — skipping Angular patch');
-} else {
-  angularFiles.forEach(f => { patchBrowser(f); patched++; });
-}
+if (angularFiles.length === 0) log.warn('No app.component.ts/app.module.ts — skipping Angular patch');
+else angularFiles.forEach(f => { patchBrowser(f); patched++; });
 
 if (patched === 0) {
   log.err('Nothing patched. Run this from your project root.');
@@ -262,18 +253,15 @@ if (patched === 0) {
 }
 
 console.log('');
-log.ok('Done! Make sure ClickHouse + relay server are running:');
+log.ok(`Done! ${patched} file(s) patched.`);
 console.log(C.cyan(`
-  # Start the relay server (from sentinel repo):
-  npx tsx server.ts
-
-  # Health check:
-  curl http://localhost:${SENTINEL_PORT}/sentinel/health
-
-  # Env vars you can set in your app:
-  SENTINEL_SERVICE=my-app
-  CLICKHOUSE_HOST=http://localhost:8123
-  CLICKHOUSE_DATABASE=sentinel
-  SENTINEL_DEBUG=true
-  LOG_LEVEL=INFO
+  ┌─────────────────────────────────────────────────┐
+  │  YOUR PC (192.168.1.153)                        │
+  │  Run:  npx tsx server.ts                        │
+  │  Check: http://192.168.1.153:4318/sentinel/health│
+  │                                                 │
+  │  CLIENT PCs — run the patch command like this:  │
+  │  SENTINEL_HOST=192.168.1.153 npx --yes          │
+  │    github:Mrithika2005/univ-sentinel-logs-v2    │
+  └─────────────────────────────────────────────────┘
 `));
