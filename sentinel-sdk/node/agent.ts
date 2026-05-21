@@ -1,28 +1,17 @@
 /* ============================================================
-   SENTINEL SDK — Node Agent  v3.1
-   Bug fixes from v3.0:
-     • CRITICAL: SentinelNode constructor set `version: this.cfg.clickhouseTable`
-       — should be SERVICE_VERSION env var. Fixed to read from process.env.
-     • DiskBuffer.write(): size check happened before appending, so the buffer
-       could silently overflow. Fixed to check+rotate before the append.
-     • _tryPatchAmqplib: createConfirmChannel was not patched — publish on
-       confirm channels was invisible. Now both channels are wrapped.
-     • _tryPatchKafkaJS: `const origKafka = Kafka` was an unused variable
-       (dead code). Removed.
-     • _patchFS: Buffer.byteLength(undefined) throws for read callbacks when
-       data is a Buffer (not a string). Now guarded with null-check + correct
-       Buffer.byteLength call for both string and Buffer types.
-     • _tryPatchPg: `require('pg')` call moved into try/catch and isolated so
-       a missing package doesn't cause an uncaught exception at module load.
-     • OtlpExporter: flushing with an empty batch after splice is guarded.
-     • middleware(): res.write byte counting now handles Buffer correctly.
-     • _patchHttp: health-port traffic detection fixed to use server localPort
-       consistently even when address() returns an object.
-     • _hookProcess disk vitals: statfs import uses dynamic import properly
-       with fallback for Node versions that don't support it.
-     • KafkaJS consumer.run: origEachMessage undefined guard added.
-     • All `catch { }` blocks (empty catches hiding errors in debug mode)
-       now log to stderr when debug=true.
+   SENTINEL SDK — Node Agent  v3.2
+   Changes from v3.1:
+     • FIX 1: memoryRssBytes added to 30s vitals heartbeat context
+       (was only in message string, not queryable as a field).
+     • FIX 2: cpuStealPercent added — reads /proc/stat steal field,
+       returns 0 gracefully on non-Linux platforms.
+     • FIX 3: diskReadBytesPerSec + diskWriteBytesPerSec added —
+       reads /proc/diskstats delta between ticks, returns 0 on
+       non-Linux platforms.
+     • FIX 4: certCheckHosts now auto-reads from SENTINEL_CERT_HOSTS
+       env var (comma-separated) when not passed in config.
+     • FIX 5: networkInBytesPerSec + networkOutBytesPerSec added —
+       per-interval delta alongside existing cumulative counters.
    ============================================================ */
 
 import {
@@ -84,10 +73,8 @@ class DiskBuffer {
 
   write(records: LogRecord[]): void {
     try {
-      const rows = records.map((r) => JSON.stringify(r.to_dict())).join('\n') + '\n';
+      const rows     = records.map((r) => JSON.stringify(r.to_dict())).join('\n') + '\n';
       const rowBytes = Buffer.byteLength(rows, 'utf-8');
-
-      // FIX: rotate BEFORE appending so we never silently overflow
       const currentSize = this._safeSize();
       if (currentSize + rowBytes > this.maxBytes) {
         this._rotate();
@@ -204,7 +191,7 @@ class ClickHouseWriter {
     const batch = this.queue.splice(0);
     if (batch.length === 0) return;
 
-    const rows = batch.map((r) => JSON.stringify(r.to_dict())).join('\n');
+    const rows  = batch.map((r) => JSON.stringify(r.to_dict())).join('\n');
     const query = `INSERT INTO ${this.database}.${this.table} FORMAT JSONEachRow`;
     try {
       const res = await fetch(`${this.host}/?query=${encodeURIComponent(query)}`, {
@@ -239,7 +226,6 @@ class ClickHouseWriter {
         body: lines.join('\n'),
       });
     } catch {
-      // Parse lines back to partial LogRecord objects for re-buffering
       const partial = lines
         .map((l) => { try { return JSON.parse(l) as LogRecord; } catch { return null; } })
         .filter(Boolean) as LogRecord[];
@@ -381,17 +367,27 @@ function _parseEnvLogLevel(): LogLevel | null {
 /* ─────────────────────────────────────────────────────────── */
 
 export class SentinelNode {
-  private cfg:         Required<SentinelNodeConfig>;
-  private writer:      ClickHouseWriter;
-  private otlp?:       OtlpExporter;
-  private instrumented = new WeakSet<object>();
-  private traceId      = _gen16Hex();
-  private processStart = Date.now();
-  private netBytesIn   = 0;
-  private netBytesOut  = 0;
-  private _enabled:    boolean;
-  private _minLevel:   LogLevel;
-  private _healthReady = false;
+  private cfg:          Required<SentinelNodeConfig>;
+  private writer:       ClickHouseWriter;
+  private otlp?:        OtlpExporter;
+  private instrumented  = new WeakSet<object>();
+  private traceId       = _gen16Hex();
+  private processStart  = Date.now();
+  private netBytesIn    = 0;
+  private netBytesOut   = 0;
+  private _enabled:     boolean;
+  private _minLevel:    LogLevel;
+  private _healthReady  = false;
+
+  /* FIX 5 — network delta state */
+  private _prevNetIn    = 0;
+  private _prevNetOut   = 0;
+  private _prevNetTime  = Date.now();
+
+  /* FIX 3 — disk I/O delta state */
+  private _prevDiskRead  = 0;
+  private _prevDiskWrite = 0;
+  private _prevDiskTime  = Date.now();
 
   constructor(config: SentinelNodeConfig = {}) {
     const diskBufferDir = config.diskBufferDir || path.join(os.tmpdir(), 'sentinel');
@@ -409,7 +405,11 @@ export class SentinelNode {
       debug:               config.debug                ?? false,
       autoInstrument:      config.autoInstrument       ?? true,
       samplingRate:        config.samplingRate         ?? 1.0,
-      certCheckHosts:      config.certCheckHosts       ?? [],
+      /* FIX 4 — auto-read cert hosts from env if not passed in config */
+      certCheckHosts:      config.certCheckHosts
+                             ?? (process.env.SENTINEL_CERT_HOSTS
+                                 ? process.env.SENTINEL_CERT_HOSTS.split(',').map((h) => h.trim()).filter(Boolean)
+                                 : []),
       certCheckIntervalMs: config.certCheckIntervalMs  ?? 6 * 60 * 60 * 1000,
       otlpEndpoint:        config.otlpEndpoint         || process.env.OTEL_EXPORTER_OTLP_ENDPOINT || '',
       healthPort:          config.healthPort           ?? Number(process.env.SENTINEL_HEALTH_PORT || 9090),
@@ -456,11 +456,10 @@ export class SentinelNode {
         processUptimeSeconds: 0,
         cpuCoreCount:         os.cpus().length,
         host:                 os.hostname(),
-        // FIX: was `this.cfg.clickhouseTable` — should be the actual service version
         version: (
-          process.env.SERVICE_VERSION ||
-          process.env.APP_VERSION     ||
-          process.env.npm_package_version ||
+          process.env.SERVICE_VERSION      ||
+          process.env.APP_VERSION          ||
+          process.env.npm_package_version  ||
           '0.0.0'
         ),
       } as LogContext,
@@ -618,13 +617,12 @@ export class SentinelNode {
   /* ── HTTP server patch (inbound) ────────────────────────── */
 
   private _patchHttp(): void {
-    const self      = this;
+    const self       = this;
     const AUTH_PATHS = /\/(login|logout|auth|token|oauth|signin|signup|refresh|verify)/i;
 
     const wrapListener = (
       listener: ((req: http.IncomingMessage, res: http.ServerResponse) => void) | undefined,
     ) => (req: http.IncomingMessage, res: http.ServerResponse) => {
-      // FIX: localPort detection — server.address() returns AddressInfo object
       const localPort = (req.socket as any)?.localPort ?? (req.socket as any)?.server?.address?.()?.port;
       if (localPort === self.cfg.healthPort) {
         listener?.(req, res);
@@ -666,16 +664,16 @@ export class SentinelNode {
       const origin = req.headers['origin'];
 
       res.on('finish', () => {
-        const durationMs   = Date.now() - start;
-        const isSlow       = durationMs > self.cfg.slowHttpMs;
-        const rateLimitHit = res.statusCode === 429;
+        const durationMs    = Date.now() - start;
+        const isSlow        = durationMs > self.cfg.slowHttpMs;
+        const rateLimitHit  = res.statusCode === 429;
         const corsViolation = res.statusCode === 403 && !!origin;
-        const resBytes     = Number(res.getHeader('content-length') || 0);
-        self.netBytesOut  += resBytes;
+        const resBytes      = Number(res.getHeader('content-length') || 0);
+        self.netBytesOut   += resBytes;
 
-        const ua           = (req.headers['user-agent'] || '').toLowerCase();
-        const botSignal    = /bot|crawl|spider|scraper|curl|wget|python-requests|go-http/.test(ua);
-        const isAuthPath   = AUTH_PATHS.test(req.url || '');
+        const ua        = (req.headers['user-agent'] || '').toLowerCase();
+        const botSignal = /bot|crawl|spider|scraper|curl|wget|python-requests|go-http/.test(ua);
+        const isAuthPath    = AUTH_PATHS.test(req.url || '');
         const isAuthFailure = res.statusCode === 401 || res.statusCode === 403;
 
         if (isAuthPath || isAuthFailure) {
@@ -771,10 +769,10 @@ export class SentinelNode {
         trace_id: traceId,
         context:  maskContext({
           method, path: path_, requestId: reqId,
-          clientIp:  req.ip || req.socket?.remoteAddress,
-          userAgent, requestSizeBytes: bodyBytes,
-          userId:    req.headers?.['x-user-id'] || req.user?.id,
-          sessionId: req.headers?.['x-session-id'],
+          clientIp:   req.ip || req.socket?.remoteAddress,
+          userAgent,  requestSizeBytes: bodyBytes,
+          userId:     req.headers?.['x-user-id'] || req.user?.id,
+          sessionId:  req.headers?.['x-session-id'],
           corsOrigin: origin,
         }) as LogContext,
       });
@@ -784,7 +782,6 @@ export class SentinelNode {
       let resBytes    = 0;
 
       res.write = (...args: any[]) => {
-        // FIX: handle both string and Buffer args safely
         if (args[0] != null) {
           resBytes += Buffer.isBuffer(args[0])
             ? args[0].length
@@ -819,7 +816,7 @@ export class SentinelNode {
             isAudit:  true,
             context:  maskContext({
               authResult:    statusCode < 400 ? 'success' : 'failure',
-              path: path_, statusCode, userAgent,
+              path: path_,   statusCode, userAgent,
               failureReason: isAuthFailure ? `HTTP ${statusCode}` : undefined,
             }) as LogContext,
           } as any);
@@ -945,7 +942,6 @@ export class SentinelNode {
               const statResult    = op === 'stat' ? cbArgs[0] : undefined;
               const fileSizeBytes = statResult?.size;
 
-              // FIX: guard against undefined data and handle Buffer vs string
               let fileReadBytes: number | undefined;
               let fileWriteBytes: number | undefined;
               if (isRead && cbArgs[0] != null) {
@@ -1017,11 +1013,13 @@ export class SentinelNode {
 
     let prevCpuTimes = os.cpus().map((c) => ({ ...c.times }));
 
-    setInterval(() => {
+    /* 30-second vitals heartbeat */
+    setInterval(async () => {
       const mem     = process.memoryUsage();
       const freeMem = os.freemem();
       const cpus    = os.cpus();
 
+      /* CPU utilization */
       const cpuPercents = cpus.map((cpu, i) => {
         const prev  = prevCpuTimes[i] || cpu.times;
         const delta = (k: keyof typeof cpu.times) => cpu.times[k] - (prev as any)[k];
@@ -1032,32 +1030,55 @@ export class SentinelNode {
       prevCpuTimes = cpus.map((c) => ({ ...c.times }));
       const cpuPercent = cpuPercents.reduce((a, b) => a + b, 0) / (cpuPercents.length || 1);
 
+      /* FIX 2 — CPU steal % from /proc/stat */
+      const cpuStealPercent = await self._readCpuSteal();
+
+      /* FIX 5 — network delta (bytes per second) */
+      const now         = Date.now();
+      const elapsedS    = Math.max((now - self._prevNetTime) / 1000, 0.001);
+      const netInDelta  = self.netBytesIn  - self._prevNetIn;
+      const netOutDelta = self.netBytesOut - self._prevNetOut;
+      const netInBps    = Math.round(netInDelta  / elapsedS);
+      const netOutBps   = Math.round(netOutDelta / elapsedS);
+      self._prevNetIn   = self.netBytesIn;
+      self._prevNetOut  = self.netBytesOut;
+      self._prevNetTime = now;
+
+      /* FIX 3 — disk I/O throughput */
+      const { readBytesPerSec, writeBytesPerSec } = await self._readDiskIO();
+
       self._emit({
         message: `Process vitals: cpu=${cpuPercent.toFixed(1)}% heap=${(mem.heapUsed / 1024 / 1024).toFixed(1)}MB rss=${(mem.rss / 1024 / 1024).toFixed(1)}MB`,
         layer:   LogLayer.INFRASTRUCTURE,
         level:   cpuPercent > 85 ? LogLevel.WARN : LogLevel.INFO,
         context: {
-          cpuPercent:           parseFloat(cpuPercent.toFixed(2)),
-          cpuCoreCount:         cpus.length,
-          memoryUsedBytes:      mem.heapUsed,
-          memoryTotalBytes:     mem.heapTotal,
-          memoryAvailableBytes: freeMem,
-          swapUsedBytes:        Math.max(0, os.totalmem() - freeMem - mem.heapUsed),
-          networkInBytes:       self.netBytesIn,
-          networkOutBytes:      self.netBytesOut,
-          containerName:        self.cfg.serviceName,
-          processUptimeSeconds: (Date.now() - self.processStart) / 1000,
-          host:                 os.hostname(),
+          cpuPercent:            parseFloat(cpuPercent.toFixed(2)),
+          cpuCoreCount:          cpus.length,
+          cpuStealPercent,                              /* FIX 2 */
+          memoryUsedBytes:       mem.heapUsed,
+          memoryTotalBytes:      mem.heapTotal,
+          memoryRssBytes:        mem.rss,               /* FIX 1 */
+          memoryAvailableBytes:  freeMem,
+          swapUsedBytes:         Math.max(0, os.totalmem() - freeMem - mem.heapUsed),
+          networkInBytes:        self.netBytesIn,
+          networkOutBytes:       self.netBytesOut,
+          networkInBytesPerSec:  Math.max(0, netInBps),  /* FIX 5 */
+          networkOutBytesPerSec: Math.max(0, netOutBps),  /* FIX 5 */
+          diskReadBytesPerSec:   readBytesPerSec,         /* FIX 3 */
+          diskWriteBytesPerSec:  writeBytesPerSec,        /* FIX 3 */
+          containerName:         self.cfg.serviceName,
+          processUptimeSeconds:  (Date.now() - self.processStart) / 1000,
+          host:                  os.hostname(),
         } as LogContext,
       });
     }, 30_000).unref();
 
-    // FIX: disk vitals — use proper async import with fallback
+    /* 60-second disk capacity heartbeat */
     setInterval(async () => {
       try {
         const { statfs } = await import('fs/promises');
         if (typeof statfs !== 'function') return;
-        const s: any = await (statfs as any)('/');
+        const s: any  = await (statfs as any)('/');
         const total   = s.bsize * s.blocks;
         const free    = s.bsize * s.bavail;
         const used    = total - free;
@@ -1075,9 +1096,72 @@ export class SentinelNode {
           } as LogContext,
         });
       } catch {
-        // statfs not available on this Node version / platform — skip silently
+        /* statfs not available on this Node version / platform — skip silently */
       }
     }, 60_000).unref();
+  }
+
+  /* ── FIX 2: CPU steal reader (/proc/stat, Linux only) ───── */
+
+  private async _readCpuSteal(): Promise<number> {
+    try {
+      const stat = await fs.promises.readFile('/proc/stat', 'utf-8');
+      const line = stat.split('\n').find((l) => l.startsWith('cpu '));
+      if (!line) return 0;
+      /*
+       * /proc/stat cpu line fields (index 1-10):
+       * user  nice  system  idle  iowait  irq  softirq  steal  guest  guest_nice
+       */
+      const parts = line.trim().split(/\s+/);
+      const steal = parseInt(parts[8] ?? '0', 10);
+      const total = parts.slice(1).reduce((s, v) => s + parseInt(v, 10), 0);
+      return total > 0 ? parseFloat(((steal / total) * 100).toFixed(2)) : 0;
+    } catch {
+      return 0; /* not Linux (Windows / macOS) — return 0 gracefully */
+    }
+  }
+
+  /* ── FIX 3: Disk I/O reader (/proc/diskstats, Linux only) ── */
+
+  private async _readDiskIO(): Promise<{ readBytesPerSec: number; writeBytesPerSec: number }> {
+    try {
+      const data = await fs.promises.readFile('/proc/diskstats', 'utf-8');
+      let totalReadSectors  = 0;
+      let totalWriteSectors = 0;
+
+      for (const line of data.split('\n')) {
+        const p = line.trim().split(/\s+/);
+        if (p.length < 10) continue;
+        const devName = p[2];
+        /*
+         * Skip partitions (sda1, sdb2) but keep whole disks (sda, sdb)
+         * and NVMe namespaces (nvme0n1).  NVMe partitions look like nvme0n1p1.
+         */
+        if (/\d$/.test(devName) && !/^nvme\d+n\d+$/.test(devName)) continue;
+        /* Fields 5 and 9 are sectors read and sectors written (512 bytes each) */
+        totalReadSectors  += parseInt(p[5],  10);
+        totalWriteSectors += parseInt(p[9],  10);
+      }
+
+      const totalReadBytes  = totalReadSectors  * 512;
+      const totalWriteBytes = totalWriteSectors * 512;
+      const now             = Date.now();
+      const elapsedS        = Math.max((now - this._prevDiskTime) / 1000, 0.001);
+
+      const readBps  = Math.round((totalReadBytes  - this._prevDiskRead)  / elapsedS);
+      const writeBps = Math.round((totalWriteBytes - this._prevDiskWrite) / elapsedS);
+
+      this._prevDiskRead  = totalReadBytes;
+      this._prevDiskWrite = totalWriteBytes;
+      this._prevDiskTime  = now;
+
+      return {
+        readBytesPerSec:  Math.max(0, readBps),
+        writeBytesPerSec: Math.max(0, writeBps),
+      };
+    } catch {
+      return { readBytesPerSec: 0, writeBytesPerSec: 0 }; /* not Linux */
+    }
   }
 
   /* ── TLS certificate monitor ─────────────────────────────── */
@@ -1098,7 +1182,9 @@ export class SentinelNode {
               level:   daysLeft < 7 ? LogLevel.FATAL : daysLeft < 14 ? LogLevel.ERROR : daysLeft < 30 ? LogLevel.WARN : LogLevel.INFO,
               context: { certDomain: hostname, certExpiryDays: daysLeft, certIssuer: issuer } as LogContext,
             });
-          } catch { /* cert parse error — handled below */ }
+          } catch {
+            if (self.cfg.debug) console.error(`[SENTINEL] cert parse error for ${hostname}`);
+          }
           socket.destroy();
         });
         socket.on('error', (err) => {
@@ -1178,8 +1264,8 @@ export class SentinelNode {
               slowQuery: isSlow, slowQueryThresholdMs: self.cfg.slowQueryMs,
               queryHash: `${sql.length}:${sql.slice(0, 20)}`,
               transactionAction: isCommit ? 'commit' : isRollback ? 'rollback' : undefined,
-              migrationName: isMigration ? sql.slice(0, 80) : undefined,
-              migrationStatus: isMigration ? 'completed' : undefined,
+              migrationName:     isMigration ? sql.slice(0, 80) : undefined,
+              migrationStatus:   isMigration ? 'completed' : undefined,
             } as LogContext,
           });
           return result;
@@ -1290,7 +1376,8 @@ export class SentinelNode {
             layer:   LogLayer.DATA_ACCESS, level: LogLevel.DEBUG,
             context: {
               database: 'redis', queryType: cmd as any, durationMs,
-              cacheHit: result !== null, cacheMiss: result === null,
+              cacheHit:      result !== null,
+              cacheMiss:     result === null,
               cacheEviction: ['DEL','UNLINK','EXPIRE','EXPIREAT'].includes(cmd),
             } as LogContext,
           });
@@ -1322,11 +1409,10 @@ export class SentinelNode {
     let amqp: any;
     try { amqp = require('amqplib'); } catch { return; }
 
-    const self          = this;
-    const origConnect   = amqp.connect.bind(amqp);
+    const self        = this;
+    const origConnect = amqp.connect.bind(amqp);
 
-    /** Patch a single channel object with publish + consume wrappers. */
-    const patchChannel  = (ch: any) => {
+    const patchChannel = (ch: any) => {
       const origPublish = ch.publish.bind(ch);
       ch.publish = (exchange: string, routingKey: string, content: Buffer, options?: any) => {
         const headers = { ...(options?.headers || {}), traceparent: buildTraceparent(self.traceId, _gen8Hex()) };
@@ -1342,9 +1428,9 @@ export class SentinelNode {
       ch.consume = async (queue: string, onMessage: Function, options?: any) => {
         return origConsume(queue, (msg: any) => {
           if (!msg) return;
-          const start    = Date.now();
-          const tp       = msg.properties?.headers?.traceparent;
-          let traceId    = self.traceId;
+          const start  = Date.now();
+          const tp     = msg.properties?.headers?.traceparent;
+          let traceId  = self.traceId;
           if (tp) { const parsed = parseTraceparent(tp); if (parsed) traceId = parsed.traceId; }
 
           try {
@@ -1372,8 +1458,6 @@ export class SentinelNode {
 
     amqp.connect = async (...args: any[]) => {
       const conn = await origConnect(...args);
-
-      // FIX: patch BOTH createChannel and createConfirmChannel
       for (const chMethod of ['createChannel', 'createConfirmChannel'] as const) {
         const origCreate = conn[chMethod]?.bind(conn);
         if (!origCreate) continue;
@@ -1454,7 +1538,6 @@ export class SentinelNode {
   private _tryPatchKafkaJS(): void {
     let Kafka: any;
     try { ({ Kafka } = require('kafkajs')); } catch { return; }
-    // FIX: removed unused `const origKafka = Kafka`
 
     const self = this;
 
@@ -1504,7 +1587,6 @@ export class SentinelNode {
           if (origRun) {
             consumer.run = (opts: any) => {
               const origEachMessage = opts?.eachMessage;
-              // FIX: guard against undefined eachMessage
               if (typeof origEachMessage === 'function') {
                 opts.eachMessage = async (payload: any) => {
                   const start = Date.now();
