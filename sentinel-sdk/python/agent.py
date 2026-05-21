@@ -1,3 +1,6 @@
+
+
+
 """
 SENTINEL SDK — Python Agent  v3.1
 ==================================
@@ -855,6 +858,16 @@ class SentinelPython:
         self._net_bytes_in  = 0
         self._net_bytes_out = 0
 
+        # FIX 5: network delta state for per-interval bytes/sec calculation
+        self._prev_net_in   = 0
+        self._prev_net_out  = 0
+        self._prev_net_time = time.time()
+
+        # FIX 3: disk I/O delta state for per-interval bytes/sec calculation
+        self._prev_disk_read  = 0
+        self._prev_disk_write = 0
+        self._prev_disk_time  = time.time()
+
         _disk_dir = cfg.get('disk_buffer_dir', os.path.join('/tmp', 'sentinel'))
 
         self._cfg = {
@@ -869,7 +882,11 @@ class SentinelPython:
             'slow_function_ms':    cfg.get('slow_function_ms',    500),
             'debug':               cfg.get('debug',               False),
             'sampling_rate':       cfg.get('sampling_rate',       1.0),
-            'cert_check_hosts':    cfg.get('cert_check_hosts',    []),
+            # FIX 4: auto-read cert hosts from SENTINEL_CERT_HOSTS env var
+            #        (comma-separated) when not passed in config
+            'cert_check_hosts':    cfg.get('cert_check_hosts') or [
+                h.strip() for h in os.getenv('SENTINEL_CERT_HOSTS', '').split(',') if h.strip()
+            ],
             'cert_check_interval': cfg.get('cert_check_interval', 6 * 3600),
             'otlp_endpoint':       cfg.get('otlp_endpoint',       os.getenv('OTEL_EXPORTER_OTLP_ENDPOINT', '')),
             'health_port':         int(cfg.get('health_port',     os.getenv('SENTINEL_HEALTH_PORT', 9090))),
@@ -888,6 +905,7 @@ class SentinelPython:
         self._instrumented: set = set()
         # FIX: _gen_16hex() now correctly generates 32 hex chars (was [:0] bug)
         self._trace_id  = _gen_16hex()
+        self._discovered_cert_hosts: set = set()
 
         if HAS_PSUTIL:
             self._prev_cpu_times = _psutil.cpu_times()
@@ -1931,12 +1949,110 @@ class SentinelPython:
 
         threading.Thread(target=disk_loop, daemon=True).start()
 
+    # ── FIX 2: CPU steal reader (/proc/stat, Linux only) ─────────────────────
+
+    def _read_cpu_steal(self) -> float:
+        """
+        Read the steal CPU percentage from /proc/stat.
+        Returns 0.0 gracefully on non-Linux platforms or any read error.
+        Fields in the 'cpu' line (0-indexed after the 'cpu' label):
+          user nice system idle iowait irq softirq steal guest guest_nice
+        Steal is at index 7 (0-based from the numeric fields).
+        """
+        try:
+            with open('/proc/stat', 'r') as f:
+                line = next((l for l in f if l.startswith('cpu ')), None)
+            if not line:
+                return 0.0
+            parts = line.strip().split()
+            steal = int(parts[8]) if len(parts) > 8 else 0   # field index 8 = steal
+            total = sum(int(p) for p in parts[1:])
+            return round((steal / total) * 100, 2) if total > 0 else 0.0
+        except Exception:
+            return 0.0   # not Linux (Windows / macOS) — return 0 gracefully
+
+    # ── FIX 3: Disk I/O reader (/proc/diskstats, Linux only) ─────────────────
+
+    def _read_disk_io(self) -> Dict[str, float]:
+        """
+        Read cumulative disk read/write sectors from /proc/diskstats, compute
+        per-second deltas against the previous call, and return bytes/sec.
+        Returns zeros gracefully on non-Linux platforms or any read error.
+
+        /proc/diskstats field layout (1-indexed):
+          1: major  2: minor  3: device
+          4: reads_completed   5: reads_merged   6: sectors_read    7: ms_reading
+          8: writes_completed  9: writes_merged  10: sectors_written 11: ms_writing
+        Sector size is 512 bytes on all Linux kernels.
+
+        Skips partition entries (e.g. sda1) but keeps whole disks (sda) and
+        NVMe namespaces (nvme0n1); NVMe partitions look like nvme0n1p1.
+        """
+        try:
+            total_read_sectors  = 0
+            total_write_sectors = 0
+            with open('/proc/diskstats', 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 10:
+                        continue
+                    dev = parts[2]
+                    # Skip partitions: ends in digit but is NOT a bare NVMe namespace
+                    if dev[-1].isdigit() and not _re.match(r'^nvme\d+n\d+$', dev):
+                        continue
+                    total_read_sectors  += int(parts[5])   # sectors read
+                    total_write_sectors += int(parts[9])   # sectors written
+
+            total_read_bytes  = total_read_sectors  * 512
+            total_write_bytes = total_write_sectors * 512
+            now               = time.time()
+            elapsed_s         = max(now - self._prev_disk_time, 0.001)
+
+            read_bps  = max(0.0, (total_read_bytes  - self._prev_disk_read)  / elapsed_s)
+            write_bps = max(0.0, (total_write_bytes - self._prev_disk_write) / elapsed_s)
+
+            self._prev_disk_read  = total_read_bytes
+            self._prev_disk_write = total_write_bytes
+            self._prev_disk_time  = now
+
+            return {
+                'diskReadBytesPerSec':  round(read_bps),
+                'diskWriteBytesPerSec': round(write_bps),
+            }
+        except Exception:
+            return {'diskReadBytesPerSec': 0, 'diskWriteBytesPerSec': 0}
+
     def _emit_vitals(self) -> None:
+        # ── FIX 5: compute network bytes/sec deltas ───────────────────────────
+        now          = time.time()
+        elapsed_s    = max(now - self._prev_net_time, 0.001)
+        net_in_delta  = self._net_bytes_in  - self._prev_net_in
+        net_out_delta = self._net_bytes_out - self._prev_net_out
+        net_in_bps    = max(0, round(net_in_delta  / elapsed_s))
+        net_out_bps   = max(0, round(net_out_delta / elapsed_s))
+        self._prev_net_in   = self._net_bytes_in
+        self._prev_net_out  = self._net_bytes_out
+        self._prev_net_time = now
+
+        # ── FIX 2: CPU steal % ────────────────────────────────────────────────
+        cpu_steal_pct = self._read_cpu_steal()
+
+        # ── FIX 3: disk I/O throughput ────────────────────────────────────────
+        disk_io = self._read_disk_io()
+
         ctx: Dict[str, Any] = {
             'containerName':        self.service_name,
             'processUptimeSeconds': time.time() - self._process_start,
             'networkInBytes':       self._net_bytes_in,
             'networkOutBytes':      self._net_bytes_out,
+            # FIX 5: per-interval network throughput
+            'networkInBytesPerSec':  net_in_bps,
+            'networkOutBytesPerSec': net_out_bps,
+            # FIX 2: CPU steal
+            'cpuStealPercent':       cpu_steal_pct,
+            # FIX 3: disk I/O throughput
+            'diskReadBytesPerSec':   disk_io['diskReadBytesPerSec'],
+            'diskWriteBytesPerSec':  disk_io['diskWriteBytesPerSec'],
             'host':                 os.getenv('HOSTNAME', socket.gethostname()),
         }
 
@@ -1960,7 +2076,8 @@ class SentinelPython:
             ctx.update({
                 'cpuPercent':           cpu_pct,
                 'cpuCoreCount':         _psutil.cpu_count(logical=True) or os.cpu_count() or 1,
-                'cpuStealPercent':      round(delta('steal') / total * 100, 2) if total > 0 and hasattr(curr, 'steal') else None,
+                # FIX 1: memoryRssBytes added as a queryable context field
+                'memoryRssBytes':       p_mem.rss,
                 'memoryUsedBytes':      p_mem.rss,
                 'memoryTotalBytes':     mem.total,
                 'memoryAvailableBytes': mem.available,
@@ -1977,7 +2094,10 @@ class SentinelPython:
             try:
                 import resource as _resource
                 usage = _resource.getrusage(_resource.RUSAGE_SELF)
-                ctx['memoryUsedBytes'] = usage.ru_maxrss * 1024
+                rss_bytes = usage.ru_maxrss * 1024
+                ctx['memoryUsedBytes'] = rss_bytes
+                # FIX 1: also set memoryRssBytes on the non-psutil path
+                ctx['memoryRssBytes']  = rss_bytes
             except Exception:
                 pass
             level = LogLevel.INFO
