@@ -30,7 +30,7 @@ import https from 'https';
 
 /* ── Config ──────────────────────────────────────────────── */
 
-const CH_HOST     = process.env.CLICKHOUSE_HOST     || 'http://localhost:8123';
+const CH_HOST     = process.env.CLICKHOUSE_HOST     || 'http://192.168.1.153:8123';
 const CH_DATABASE = process.env.CLICKHOUSE_DATABASE || 'sentinel';
 const CH_TABLE    = process.env.CLICKHOUSE_TABLE    || 'logs';
 const CH_USER     = process.env.CLICKHOUSE_USER     || '';
